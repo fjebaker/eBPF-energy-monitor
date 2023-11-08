@@ -11,8 +11,8 @@ const c = @cImport({
 const arch = builtin.target.cpu.arch;
 const KernelError = error{KernelReadError};
 
-inline fn printk(comptime fmt: [:0]const u8, arg: u64, arg2: u64) void {
-    _ = helpers.trace_printk(fmt.ptr, fmt.len + 1, arg, arg2, 0);
+inline fn printk(comptime fmt: [:0]const u8, arg: u64, arg2: u64, arg3: u64) void {
+    _ = helpers.trace_printk(fmt.ptr, fmt.len + 1, arg, arg2, arg3);
 }
 
 const Registers = struct {
@@ -56,7 +56,10 @@ const SchedSwitch = extern struct {
 export fn context_monitor(
     ctx: *SchedSwitch,
 ) linksection("tp/sched/sched_switch") c_int {
-    printk("From %d -> %d", ctx.prev_pid, ctx.next_pid);
+    const ts = helpers.ktime_get_ns();
+    const smp_id: u64 = @intCast(helpers.get_smp_processor_id());
+    printk("T: %d ID: %d", ts, smp_id, 0);
+    printk("%d -> %d", ctx.prev_pid, ctx.next_pid, 0);
     return 0;
 }
 
