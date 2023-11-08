@@ -20,9 +20,15 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     obj.addIncludePath(.{ .path = "include" }); // to get the vmlinux.h
-    obj.strip = true;
-
     // the magic
     const install = b.addInstallFile(obj.getEmittedBin(), "zig-bpf.o");
-    b.getInstallStep().dependOn(&install.step);
+    // b.getInstallStep().dependOn(&install.step);
+
+    const strip_cmd = b.addSystemCommand(&.{
+        "llvm-strip",
+        "-g",
+        "zig-out/zig-bpf.o",
+    });
+    strip_cmd.step.dependOn(&install.step);
+    b.getInstallStep().dependOn(&strip_cmd.step);
 }
