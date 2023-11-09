@@ -15,28 +15,59 @@ inline fn printk(comptime fmt: [:0]const u8, arg: u64, arg2: u64, arg3: u64) voi
     _ = helpers.trace_printk(fmt.ptr, fmt.len + 1, arg, arg2, arg3);
 }
 
-const Registers = struct {
-    di: u64,
-    si: u64,
-    dx: u64,
-    cx: u64,
-    r8: u64,
+const UpdateType = enum(u64) {
+    any = eBPF.ANY,
+    no_exist = eBPF.NOEXIST,
+    exist = eBPF.EXIST,
+};
 
-    pub fn fromRawArgs(r: RawArgs) Registers {
-        const regs: *c.pt_regs = @ptrCast(&r.ptr[0]);
-        return .{
-            .di = regs.di,
-            .si = regs.si,
-            .dx = regs.dx,
-            .cx = regs.cx, // would be r10 for a syscall arg 3
-            .r8 = regs.r8,
+fn HashMap(comptime symbol_name: []const u8, comptime Val: type) type {
+    return extern struct {
+        const Self = @This();
+        const Key = u32;
+
+        pub const MapError = error{UpdateError};
+
+        const Layout = extern struct {
+            type: ?*[@intFromEnum(eBPF.MapType.hash)]u32,
+            max_entries: ?*[10240]u32,
+            key: *Key,
+            value: *Val,
         };
-    }
-};
 
-const RawArgs = extern struct {
-    ptr: [*]u64,
-};
+        // how we get the data
+        var ptr: Layout = undefined;
+        comptime {
+            @export(Self.ptr, .{ .name = symbol_name, .section = ".maps" });
+        }
+
+        pub fn get(_: *Self, key: Key) ?*Val {
+            const elem = helpers.map_lookup_elem(@ptrCast(&ptr), &key);
+
+            if (elem) |e| {
+                const val: *Val = @ptrCast(@alignCast(e));
+                return val;
+            }
+
+            return null;
+        }
+
+        pub const UpdateOptions = struct {
+            utype: UpdateType = .no_exist,
+        };
+
+        pub fn update(_: *Self, key: Key, val: Val, opts: UpdateOptions) !void {
+            const ret = helpers.map_update_elem(
+                @ptrCast(&ptr),
+                &key,
+                &val,
+                @intFromEnum(opts.utype),
+            );
+            if (ret != 0)
+                return MapError.UpdateError;
+        }
+    };
+}
 
 const SchedSwitch = extern struct {
     common_type: u16,
@@ -53,13 +84,20 @@ const SchedSwitch = extern struct {
     next_prio: u32,
 };
 
+var lookup: HashMap("lookup", u64) = undefined;
+
+inline fn logic(ctx: *SchedSwitch) !void {
+    const ts = helpers.ktime_get_ns();
+    const smp_id = helpers.get_smp_processor_id();
+    // printk("T: %d ID: %d", ts, smp_id, 0);
+    printk("%d -> %d", ctx.prev_pid, ctx.next_pid, 0);
+    try lookup.update(smp_id, ts, .{ .utype = .any });
+}
+
 export fn context_monitor(
     ctx: *SchedSwitch,
 ) linksection("tp/sched/sched_switch") c_int {
-    const ts = helpers.ktime_get_ns();
-    const smp_id: u64 = @intCast(helpers.get_smp_processor_id());
-    printk("T: %d ID: %d", ts, smp_id, 0);
-    printk("%d -> %d", ctx.prev_pid, ctx.next_pid, 0);
+    logic(ctx) catch return 1;
     return 0;
 }
 
