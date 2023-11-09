@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
     const arch = (target.cpu_arch orelse builtin.cpu.arch);
     const bpf_target: std.zig.CrossTarget =
         .{
@@ -30,15 +31,44 @@ pub fn build(b: *std.Build) void {
     c_obj.addIncludePath(.{ .path = "/usr/include" });
     c_obj.addIncludePath(.{ .path = "include" });
 
-    // todo: generate the vmlinux.h
-    const install = b.addInstallFile(c_obj.getEmittedBin(), "c-bpf.o");
+    // get the object output path and strip it
+    //
+    const c_obj_path = c_obj.getEmittedBin();
+    const install = b.addInstallFile(c_obj_path, "c-bpf.o");
 
     const strip_cmd = b.addSystemCommand(&.{
         "llvm-strip",
         "-g",
-        "zig-out/c-bpf.o",
     });
+    strip_cmd.addFileArg(c_obj_path);
     strip_cmd.step.dependOn(&install.step);
 
+    // install the object path for inspection purposes, after it has been stripped
     b.getInstallStep().dependOn(&strip_cmd.step);
+
+    const exe = b.addExecutable(.{
+        .name = "emon",
+        .root_source_file = .{ .path = "src/main.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.linkLibC();
+    exe.addIncludePath(.{ .path = "/usr/include" });
+    exe.addIncludePath(.{ .path = "include" });
+    exe.linkSystemLibrary("bpf");
+
+    exe.addAnonymousModule("@PROG_BPF", .{ .source_file = c_obj_path });
+
+    exe.step.dependOn(&strip_cmd.step);
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+
+    const run_step = b.step("run", "Run the application");
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
+    }
+
+    run_step.dependOn(&run_cmd.step);
 }
