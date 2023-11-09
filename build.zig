@@ -13,22 +13,32 @@ pub fn build(b: *std.Build) void {
         .os_tag = .freestanding,
     };
 
-    const obj = b.addObject(.{
-        .name = "zig-bpf-prog",
-        .root_source_file = .{ .path = "src/main.bpf.zig" },
-        .target = bpf_target,
-        .optimize = .ReleaseFast,
-    });
-    obj.addIncludePath(.{ .path = "include" }); // to get the vmlinux.h
-    // the magic
-    const install = b.addInstallFile(obj.getEmittedBin(), "zig-bpf.o");
-    // b.getInstallStep().dependOn(&install.step);
+    const c_obj = b.addObject(
+        .{
+            .name = "c-bpf.o",
+            .target = bpf_target,
+            .optimize = .ReleaseFast,
+        },
+    );
+    c_obj.addCSourceFile(
+        .{
+            .file = .{ .path = "src/main.bpf.c" },
+            .flags = &.{ "-Wall", "-D__BPF_TRACING__" },
+        },
+    );
+    c_obj.linkLibC();
+    c_obj.addIncludePath(.{ .path = "/usr/include" });
+    c_obj.addIncludePath(.{ .path = "include" });
+
+    // todo: generate the vmlinux.h
+    const install = b.addInstallFile(c_obj.getEmittedBin(), "c-bpf.o");
 
     const strip_cmd = b.addSystemCommand(&.{
         "llvm-strip",
         "-g",
-        "zig-out/zig-bpf.o",
+        "zig-out/c-bpf.o",
     });
     strip_cmd.step.dependOn(&install.step);
+
     b.getInstallStep().dependOn(&strip_cmd.step);
 }
