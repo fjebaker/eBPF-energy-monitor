@@ -118,6 +118,8 @@ pub fn main() !void {
 
     try stdout.writeAll("Entering main loop\n");
     var writer = stdout.writer();
+
+    var list = std.ArrayList(ProcessData).init(alloc);
     while (true) {
         std.time.sleep(1_000_000_000);
 
@@ -125,13 +127,44 @@ pub fn main() !void {
 
         while (hmap.next()) |key| {
             const values = hmap.get(key) orelse continue;
-            try writer.print("PID {d: >8}: ", .{key});
-            for (values) |v| {
-                try writer.print(" {d: >8}", .{v});
+            try list.append(ProcessData.init(key, values));
+        }
+
+        // sort by which processes had cumilatively the longest time
+        std.sort.insertion(ProcessData, list.items, {}, totalTimeSort);
+        std.mem.reverse(ProcessData, list.items);
+
+        for (list.items[1..], 0..) |item, i| {
+            if (i > 5) break;
+            try writer.print("PID {d: >8}: ", .{item.pid});
+            for (item.times, 0..) |time, k| {
+                if (k % 2 == 1) continue;
+                try writer.print(" {d: >8}", .{time});
             }
             try writer.writeAll("\n");
         }
+        try writer.writeAll("\n");
+
+        list.items.len = 0; // defacto free all
     }
+}
+
+const ProcessData = struct {
+    pid: u32,
+    times: [8]u32,
+    sum_times: u32,
+
+    fn init(pid: u32, times: [8]u32) ProcessData {
+        var sum: u32 = 0;
+        for (times) |t| {
+            sum +|= t;
+        }
+        return .{ .pid = pid, .times = times, .sum_times = sum };
+    }
+};
+
+fn totalTimeSort(_: void, lhs: ProcessData, rhs: ProcessData) bool {
+    return lhs.sum_times < rhs.sum_times;
 }
 
 const MAP_PIN_FILE = "/sys/fs/bpf/runtime_lookup-map";
