@@ -41,16 +41,38 @@ struct {
 // lookup when prev went in
 // print how long it was in
 
+unsigned int unsigned_div1000(unsigned n) {
+    unsigned q, r, t;
+
+    t = (n >> 7) + (n >> 8) + (n >> 12);
+    q = (n >> 1) + t + (n >> 15) + (t >> 11) + (t >> 14);
+    q = q >> 9;
+    r = n - q*1000;
+    return q + ((r + 24) >> 10);
+}
+
+int signed_div1000(int n) {
+    int q, r, t;
+    n = n + (n>>31 & 999);
+    t = (n >> 7) + (n >> 8) + (n >> 12);
+    q = (n >> 1) + t + (n >> 15) + (t >> 11) + (t >> 14) +
+    (n >> 26) + (t >> 21);
+    q = q >> 9;
+    r = n - q*1000;
+    return q + ((r + 24) >> 10);
+}
+
 inline int update_runtime(int *pid, int delta) {
     // check if we have the element already, if so, increment
     // else set it to delta
-    int time_delta = delta;
+    int time_delta = signed_div1000(delta);
     int *current = (int *) bpf_map_lookup_elem(&runtime_lookup, pid);
 
     if (current != 0) {
        time_delta += (*current);
     }
 
+    /* bpf_printk("PID %d TOTAL %d\n", (*pid), time_delta); */
     return bpf_map_update_elem(&runtime_lookup, pid, &time_delta, BPF_ANY);
 }
 
@@ -67,7 +89,9 @@ int context_monitor(sched_switch_s *ctx) {
         // calculate and print the delta of the out process
         int delta = ts - (*old_ts_ptr);
         bpf_printk("SMP %d: %d ns for  %d", smp_id, delta, ctx->prev_pid );
-        update_runtime(&prev_pid, delta);
+        if (0 != update_runtime(&prev_pid, delta)) {
+            return 1;
+        }
     }
 
     // write the time the current process went in

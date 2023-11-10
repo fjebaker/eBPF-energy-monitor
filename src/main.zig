@@ -5,7 +5,13 @@ const c = @cImport({
 
 const PROG_BPF = @embedFile("@PROG_BPF");
 
-const LibBpfError = error{ OpenError, LoadError, AttachError };
+const LibBpfError = error{
+    OpenError,
+    LoadError,
+    AttachError,
+    NoSuchMap,
+    FailedToPin,
+};
 
 pub const BpfProg = struct {
     const LinkList = std.ArrayList(*c.bpf_link);
@@ -71,6 +77,23 @@ pub const BpfProg = struct {
             return LibBpfError.LoadError;
         }
     }
+
+    pub fn getMap(bp: *BpfProg, name: []const u8) !c_int {
+        const map_ptr = c.bpf_object__find_map_by_name(bp.obj, name.ptr);
+        if (map_ptr) |ptr| {
+            return c.bpf_map__fd(ptr);
+        }
+        return LibBpfError.NoSuchMap;
+    }
+};
+
+pub const BpfMap = struct {
+    alloc: std.mem.Allocator,
+    fd: c_int,
+
+    pub fn init(alloc: std.mem.Allocator, fd: c_int) BpfMap {
+        return .{ .alloc = alloc, .fd = fd };
+    }
 };
 
 pub fn main() !void {
@@ -90,8 +113,73 @@ pub fn main() !void {
     try prog.load();
     try prog.attach();
 
+    var map_ptr = c.bpf_object__find_map_by_name(prog.obj, "runtime_lookup").?;
+    var hmap = PerCpuHashMap.init(map_ptr);
+
+    try stdout.writeAll("Entering main loop\n");
+    var writer = stdout.writer();
     while (true) {
         std.time.sleep(1_000_000_000);
-        try stdout.writeAll(".");
+
+        hmap.reset();
+
+        while (hmap.next()) |key| {
+            const values = hmap.get(key) orelse continue;
+            try writer.print("PID {d: >8}: ", .{key});
+            for (values) |v| {
+                try writer.print(" {d: >8}", .{v});
+            }
+            try writer.writeAll("\n");
+        }
     }
 }
+
+const MAP_PIN_FILE = "/sys/fs/bpf/runtime_lookup-map";
+
+const PerCpuHashMap = struct {
+    map: *c.struct_bpf_map,
+    fd: c_int,
+    key: ?u32 = null,
+
+    pub fn init(map: *c.struct_bpf_map) PerCpuHashMap {
+        const fd = c.bpf_map__fd(map);
+        return .{ .map = map, .fd = fd };
+    }
+
+    pub fn get(hmap: *PerCpuHashMap, key: u32) ?[8]u32 {
+        var values: [8]u32 = .{0} ** 8;
+        const ret = c.bpf_map__lookup_elem(
+            hmap.map,
+            &key,
+            @sizeOf(u32),
+            &values,
+            values.len * @sizeOf(u32),
+            0,
+        );
+        if (ret == 0) {
+            return values;
+        }
+        return null;
+    }
+
+    pub fn reset(hmap: *PerCpuHashMap) void {
+        hmap.key = null;
+    }
+
+    pub fn next(hmap: *PerCpuHashMap) ?u32 {
+        const curr: ?*u32 = if (hmap.key) |*key| key else null;
+        var next_key: u32 = undefined;
+        const ret = c.bpf_map__get_next_key(hmap.map, curr, &next_key, @sizeOf(u32));
+        switch (ret) {
+            0 => {
+                hmap.key = next_key;
+                return next_key;
+            },
+            -1 => return null, // last element
+            else => {
+                std.debug.print("ret: {d}\n", .{ret});
+            },
+        }
+        return null;
+    }
+};
