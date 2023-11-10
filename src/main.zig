@@ -13,11 +13,13 @@ const CPU_PATHS = [_][]const u8{
 pub const ProcessData = struct {
     pid: u32,
     times: [8]u32,
+    occupancy: [8]f32 = .{0} ** 8,
     sum_times: u32,
 
     fn init(pid: u32, times: [8]u32) ProcessData {
         var sum: u32 = 0;
-        for (times) |t| {
+        for (0.., times) |i, t| {
+            if (i % 2 == 1) continue;
             sum +|= t;
         }
         return .{ .pid = pid, .times = times, .sum_times = sum };
@@ -64,6 +66,25 @@ pub const Monitor = struct {
         std.mem.reverse(ProcessData, m.procs.items);
 
         m.integrateTimes();
+
+        m.calculateOccupancy();
+    }
+
+    fn calculateOccupancy(m: *Monitor) void {
+        for (m.procs.items) |*proc| {
+            var occupancy: [8]f32 = undefined;
+            for (0.., m.times) |i, total_time| {
+                occupancy[i * 2] =
+                    @as(
+                    f32,
+                    @floatFromInt(proc.times[i * 2]),
+                ) / @as(
+                    f32,
+                    @floatFromInt(total_time),
+                );
+            }
+            proc.occupancy = occupancy;
+        }
     }
 
     fn sumIndex(items: []const ProcessData, index: usize) u32 {
@@ -139,6 +160,7 @@ pub fn main() !void {
         try mon.readMap(&hmap);
         try printTopN(writer, mon.procs.items, 5);
 
+        try writer.print("----\nTotal number of procs: {d}\n", .{mon.procs.items.len});
         try writer.writeAll("----\nTot         : ");
         try printLine(writer, u32, mon.times, false);
         try writer.writeAll("\n");
@@ -153,7 +175,7 @@ pub fn main() !void {
 fn printEnergy(writer: anytype, items: []const u64) !void {
     try writer.writeAll("Energy (uj) : ");
     for (items) |i| {
-        try writer.print(" {d: >17}", .{i});
+        try writer.print(" {d: >31}", .{i});
     }
     try writer.writeAll("\n");
 }
@@ -164,17 +186,17 @@ fn printTopN(writer: anytype, items: []const ProcessData, N: usize) !void {
     for (items, 0..) |proc, i| {
         if (i > N) break;
         try writer.print("PID {d: >8}: ", .{proc.pid});
-        try printLine(writer, u32, &proc.times, true);
+        for (0.., proc.times, proc.occupancy) |k, t, o| {
+            if (k % 2 == 1) continue;
+            try writer.print(" {d: >8} ({d: >3.0}%)", .{ t, o * 100 });
+        }
         try writer.writeAll("\n");
     }
 }
 
 fn printLine(writer: anytype, comptime T: type, items: []const T, skip: bool) !void {
     for (0.., items) |i, v| {
-        // ignore every second one
-        // for some reason those are always zero or 1?
-        // todo: find out why
         if (skip and i % 2 == 1) continue;
-        try writer.print(" {d: >8}", .{v});
+        try writer.print(" {d: >15}", .{v});
     }
 }
