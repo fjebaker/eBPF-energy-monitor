@@ -10,7 +10,7 @@ const CPU_PATHS = [_][]const u8{
     "intel-rapl:1",
 };
 
-const ProcessData = struct {
+pub const ProcessData = struct {
     pid: u32,
     times: [8]u32,
     sum_times: u32,
@@ -21,6 +21,64 @@ const ProcessData = struct {
             sum +|= t;
         }
         return .{ .pid = pid, .times = times, .sum_times = sum };
+    }
+};
+
+pub const Monitor = struct {
+    alloc: std.mem.Allocator,
+    times: []u32,
+    procs: std.ArrayList(ProcessData),
+
+    pub fn init(alloc: std.mem.Allocator, nprocs: usize) !Monitor {
+        var times = try alloc.alloc(u32, nprocs);
+        return .{
+            .alloc = alloc,
+            .times = times,
+            .procs = std.ArrayList(ProcessData).init(alloc),
+        };
+    }
+
+    pub fn deinit(m: *Monitor) void {
+        m.alloc.free(m.times);
+        m.procs.deinit();
+        m.* = undefined;
+    }
+
+    pub fn clear(m: *Monitor) void {
+        // defactor free all without freeing
+        m.procs.items.len = 0;
+    }
+
+    pub fn readMap(m: *Monitor, map: *RuntimeMap) !void {
+        // reset the map before we read so that we iterate the keys
+        map.reset();
+
+        while (map.nextKey()) |key| {
+            const values = map.pop(key) orelse continue;
+            try m.procs.append(ProcessData.init(key, values));
+        }
+
+        // sort by which processes had cumilatively the longest time across all cores
+        std.sort.insertion(ProcessData, m.procs.items, {}, totalTimeSort);
+        // descending order
+        std.mem.reverse(ProcessData, m.procs.items);
+
+        m.integrateTimes();
+    }
+
+    fn sumIndex(items: []const ProcessData, index: usize) u32 {
+        var total: u32 = 0;
+        for (items) |item| {
+            total += item.times[index];
+        }
+        return total;
+    }
+
+    fn integrateTimes(m: *Monitor) void {
+        for (m.times, 0..) |*t, i| {
+            // again have to account for the skip so mult by 2
+            t.* = sumIndex(m.procs.items, i * 2);
+        }
     }
 };
 
@@ -62,7 +120,10 @@ pub fn main() !void {
     defer prog.deinit();
 
     var hmap = try prog.getMap(RuntimeMap, "runtime_lookup");
-    var list = std.ArrayList(ProcessData).init(alloc);
+
+    var mon = try Monitor.init(alloc, 4);
+    defer mon.deinit();
+
     while (true) {
         std.time.sleep(1_000_000_000);
 
@@ -75,35 +136,18 @@ pub fn main() !void {
             init_energies[i] = current_energies[i];
         }
 
-        try readFromBPF(&list, &hmap);
-        try printTopN(writer, list.items, 5);
+        try mon.readMap(&hmap);
+        try printTopN(writer, mon.procs.items, 5);
+
+        try writer.writeAll("----\nTot         : ");
+        try printLine(writer, u32, mon.times, false);
+        try writer.writeAll("\n");
+
         try printEnergy(writer, &energy_diff);
         try writer.writeAll("\n");
 
-        list.items.len = 0; // defacto free all
+        mon.clear();
     }
-}
-
-fn readFromBPF(list: *std.ArrayList(ProcessData), map: *RuntimeMap) !void {
-    map.reset();
-    // iterate over all keys, read and remove them
-    while (map.nextKey()) |key| {
-        const values = map.pop(key) orelse continue;
-        try list.append(ProcessData.init(key, values));
-    }
-
-    // sort by which processes had cumilatively the longest time across all cores
-    std.sort.insertion(ProcessData, list.items, {}, totalTimeSort);
-    // descending order
-    std.mem.reverse(ProcessData, list.items);
-}
-
-fn sumIndex(items: []const ProcessData, index: usize) u32 {
-    var total: u32 = 0;
-    for (items) |item| {
-        total += item.times[index];
-    }
-    return total;
 }
 
 fn printEnergy(writer: anytype, items: []const u64) !void {
@@ -117,25 +161,20 @@ fn printEnergy(writer: anytype, items: []const u64) !void {
 fn printTopN(writer: anytype, items: []const ProcessData, N: usize) !void {
     try writer.writeAll("Top 5:\n");
 
-    for (items, 0..) |item, i| {
+    for (items, 0..) |proc, i| {
         if (i > N) break;
-        try writer.print("PID {d: >8}: ", .{item.pid});
-        for (item.times, 0..) |time, k| {
-            // ignore every second one
-            // for some reason those are always zero or 1?
-            // todo: find out why
-            if (k % 2 == 1) continue;
-            try writer.print(" {d: >8}", .{time});
-        }
+        try writer.print("PID {d: >8}: ", .{proc.pid});
+        try printLine(writer, u32, &proc.times, true);
         try writer.writeAll("\n");
     }
+}
 
-    try writer.writeAll("----\nTot         : ");
-    for (0..8) |i| {
-        if (i % 2 == 1) continue;
-        const tot = sumIndex(items, i);
-        try writer.print(" {d: >8}", .{tot});
+fn printLine(writer: anytype, comptime T: type, items: []const T, skip: bool) !void {
+    for (0.., items) |i, v| {
+        // ignore every second one
+        // for some reason those are always zero or 1?
+        // todo: find out why
+        if (skip and i % 2 == 1) continue;
+        try writer.print(" {d: >8}", .{v});
     }
-
-    try writer.writeAll("\n");
 }
