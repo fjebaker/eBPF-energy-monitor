@@ -25,7 +25,8 @@ pub const BpfProg = struct {
     obj: ?*c.struct_bpf_object = null,
     links: LinkList,
 
-    pub fn init(alloc: std.mem.Allocator, bytes: []const u8) BpfProg {
+    /// BpfProg owns the memory and will free it
+    pub fn initOwned(alloc: std.mem.Allocator, bytes: []const u8) BpfProg {
         const links = LinkList.init(alloc);
         return .{
             .alloc = alloc,
