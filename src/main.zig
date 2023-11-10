@@ -28,11 +28,11 @@ pub const ProcessData = struct {
 
 pub const Monitor = struct {
     alloc: std.mem.Allocator,
-    times: []u32,
+    times: []u64,
     procs: std.ArrayList(ProcessData),
 
     pub fn init(alloc: std.mem.Allocator, nprocs: usize) !Monitor {
-        var times = try alloc.alloc(u32, nprocs);
+        var times = try alloc.alloc(u64, nprocs);
         return .{
             .alloc = alloc,
             .times = times,
@@ -103,6 +103,51 @@ pub const Monitor = struct {
     }
 };
 
+pub const EnergyUsage = struct {
+    const EMap = std.AutoHashMap(u32, std.ArrayList(f32)); // pid -> energy time series
+
+    alloc: std.mem.Allocator,
+    emaps: []EMap,
+    times: std.ArrayList(u64),
+
+    pub fn init(alloc: std.mem.Allocator, N: usize) !EnergyUsage {
+        var emaps = try alloc.alloc(EMap, N);
+        errdefer alloc.free(emaps);
+
+        var times = std.ArrayList(u64).init(alloc);
+        errdefer times.deinit();
+
+        for (emaps) |*e| e.* = EMap.init(alloc);
+
+        return .{ .alloc = alloc, .emaps = emaps, .times = times };
+    }
+
+    pub fn put(self: *EnergyUsage, index: usize, key: u32, value: f32) !void {
+        var map: *EMap = &self.emaps[index];
+        if (map.contains(key)) {
+            try map.getPtr(key).?.append(value);
+        } else {
+            var array_list = std.ArrayList(f32).init(self.alloc);
+            errdefer array_list.deinit();
+            try array_list.append(value);
+            try map.put(key, array_list);
+        }
+    }
+
+    pub fn deinit(self: *EnergyUsage) void {
+        for (self.emaps) |*e| {
+            var itt = e.valueIterator();
+            while (itt.next()) |v| {
+                v.deinit();
+            }
+            e.deinit();
+        }
+        self.alloc.free(self.emaps);
+        self.times.deinit();
+        self.* = undefined;
+    }
+};
+
 fn totalTimeSort(_: void, lhs: ProcessData, rhs: ProcessData) bool {
     return lhs.sum_times < rhs.sum_times;
 }
@@ -145,6 +190,10 @@ pub fn main() !void {
     var mon = try Monitor.init(alloc, 4);
     defer mon.deinit();
 
+    var usage = try EnergyUsage.init(alloc, 2);
+    defer usage.deinit();
+
+    var counter: usize = 0;
     while (true) {
         std.time.sleep(1_000_000_000);
 
@@ -162,15 +211,44 @@ pub fn main() !void {
 
         try writer.print("----\nTotal number of procs: {d}\n", .{mon.procs.items.len});
         try writer.writeAll("----\nTot         : ");
-        try printLine(writer, u32, mon.times, false);
+        try printLine(writer, u64, mon.times, false);
         try writer.writeAll("\n");
 
         try printEnergy(writer, &energy_diff);
         try writer.writeAll("\n");
 
+        // sum over socket
+        for (0.., energy_diff) |i, en| {
+            const i_1 = i * 2;
+            const i_2 = (i + 1) * 2;
+
+            const total_cpu_time: f32 = @floatFromInt(mon.times[i] + mon.times[i + 1]);
+            const energy: f32 = @floatFromInt(en);
+
+            for (mon.procs.items) |proc| {
+                const t1: f32 = @floatFromInt(proc.times[i_1]);
+                const t2: f32 = @floatFromInt(proc.times[i_2]);
+                const e_usage = (t1 + t2) / total_cpu_time * energy;
+                try usage.put(i, proc.pid, e_usage);
+            }
+        }
+
         mon.clear();
+        if (counter == 20) break;
+        counter += 1;
     }
 }
+
+const OutputStructure = struct {
+    times: []u64,
+    cpu: struct {
+        id: usize,
+        pids: struct {
+            pid: u32,
+            usage: []f32,
+        },
+    },
+};
 
 fn printEnergy(writer: anytype, items: []const u64) !void {
     try writer.writeAll("Energy (uj) : ");
