@@ -10,96 +10,140 @@ const CPU_PATHS = [_][]const u8{
     "intel-rapl:1",
 };
 
-pub const ProcessData = struct {
-    pid: u32,
-    times: [8]u32,
-    occupancy: [8]f32 = .{0} ** 8,
-    sum_times: u32,
+pub const PidEntry = struct {
+    times: []u32,
+    occupancy: []f32,
+    total_time: u64,
 
-    fn init(pid: u32, times: [8]u32) ProcessData {
-        var sum: u32 = 0;
-        for (0.., times) |i, t| {
-            if (i % 2 == 1) continue;
-            sum +|= t;
+    pub fn init(alloc: std.mem.Allocator, all_times: [8]u32) !PidEntry {
+        var times = try alloc.alloc(u32, 4);
+        var occupancy = try alloc.alloc(f32, 4);
+
+        var total_time: u64 = 0;
+        for (times, 0..) |*t, i| {
+            t.* = all_times[i * 2];
+            total_time += t.*;
         }
-        return .{ .pid = pid, .times = times, .sum_times = sum };
+        return .{
+            .times = times,
+            .occupancy = occupancy,
+            .total_time = total_time,
+        };
     }
 };
 
-pub const Monitor = struct {
-    alloc: std.mem.Allocator,
-    times: []u64,
-    procs: std.ArrayList(ProcessData),
+pub const EnergyTracker = struct {
+    pub const TimeSeries = std.ArrayList(u32);
 
-    pub fn init(alloc: std.mem.Allocator, nprocs: usize) !Monitor {
-        var times = try alloc.alloc(u64, nprocs);
+    usage: TimeSeries,
+
+    pub fn init(alloc: std.mem.Allocator) EnergyTracker {
+        return .{ .usage = TimeSeries.init(alloc) };
+    }
+};
+
+pub const RawData = struct {
+    pub const PidMap = std.AutoHashMap(u32, PidEntry);
+
+    data: PidMap,
+    arena: std.heap.ArenaAllocator,
+    times: []u64,
+
+    pub fn init(alloc: std.mem.Allocator, n_proc: usize) !RawData {
+        var times = try alloc.alloc(u64, n_proc);
         return .{
-            .alloc = alloc,
+            .data = PidMap.init(alloc),
+            .arena = std.heap.ArenaAllocator.init(alloc),
             .times = times,
-            .procs = std.ArrayList(ProcessData).init(alloc),
         };
     }
 
-    pub fn deinit(m: *Monitor) void {
-        m.alloc.free(m.times);
-        m.procs.deinit();
-        m.* = undefined;
+    pub fn deinit(self: *RawData) void {
+        self.data.deinit();
+        self.arena.child_allocator.free(self.times);
+        self.arena.deinit();
+        self.* = undefined;
     }
 
-    pub fn clear(m: *Monitor) void {
-        // defactor free all without freeing
-        m.procs.items.len = 0;
+    pub fn clear(self: *RawData) void {
+        self.data.clearRetainingCapacity();
     }
 
-    pub fn readMap(m: *Monitor, map: *RuntimeMap) !void {
+    // Caller owns the memory
+    pub fn getPids(self: *const RawData, alloc: std.mem.Allocator) ![]u32 {
+        var pids = try std.ArrayList(u32).initCapacity(alloc, self.data.count());
+        errdefer pids.deinit();
+
+        var itt = self.data.keyIterator();
+        while (itt.next()) |key| {
+            try pids.append(key.*);
+        }
+
+        return pids.toOwnedSlice();
+    }
+
+    fn durationSort(self: *const RawData, lhs: u32, rhs: u32) bool {
+        const lhs_entry = self.data.get(lhs).?;
+        const rhs_entry = self.data.get(rhs).?;
+        return lhs_entry.total_time > rhs_entry.total_time;
+    }
+
+    // Caller owns the memory
+    pub fn getOccupancySortedPids(
+        self: *const RawData,
+        alloc: std.mem.Allocator,
+    ) ![]u32 {
+        var pids = try self.getPids(alloc);
+
+        std.sort.insertion(u32, pids, self, durationSort);
+        return pids;
+    }
+
+    fn pushEntry(rd: *RawData, pid: u32, entry: PidEntry) !void {
+        var existing: *PidEntry = rd.data.getPtr(pid) orelse {
+            try rd.data.putNoClobber(pid, entry);
+            return;
+        };
+
+        for (0..existing.occupancy.len) |i| {
+            existing.times[i] += entry.times[i];
+            existing.total_time += entry.total_time;
+        }
+    }
+
+    fn calculateOccupancy(self: *RawData) void {
+        var itt = self.data.valueIterator();
+
+        while (itt.next()) |vptr| {
+            for (vptr.occupancy, vptr.times, self.times) |*o, t, tot| {
+                const time: f32 = @floatFromInt(t);
+                const total: f32 = @floatFromInt(tot);
+
+                o.* = time / total;
+            }
+        }
+    }
+
+    pub fn readMap(rd: *RawData, map: *RuntimeMap) !void {
         // reset the map before we read so that we iterate the keys
         map.reset();
 
+        for (rd.times) |*t| t.* = 0;
+
+        var alloc = rd.arena.allocator();
+
         while (map.nextKey()) |key| {
             const values = map.pop(key) orelse continue;
-            try m.procs.append(ProcessData.init(key, values));
-        }
+            const entry = try PidEntry.init(alloc, values);
 
-        // sort by which processes had cumilatively the longest time across all cores
-        std.sort.insertion(ProcessData, m.procs.items, {}, totalTimeSort);
-        // descending order
-        std.mem.reverse(ProcessData, m.procs.items);
+            try rd.pushEntry(key, entry);
 
-        m.integrateTimes();
-
-        m.calculateOccupancy();
-    }
-
-    fn calculateOccupancy(m: *Monitor) void {
-        for (m.procs.items) |*proc| {
-            var occupancy: [8]f32 = undefined;
-            for (0.., m.times) |i, total_time| {
-                occupancy[i * 2] =
-                    @as(
-                    f32,
-                    @floatFromInt(proc.times[i * 2]),
-                ) / @as(
-                    f32,
-                    @floatFromInt(total_time),
-                );
+            for (rd.times, entry.times) |*t, add| {
+                t.* += add;
             }
-            proc.occupancy = occupancy;
         }
-    }
 
-    fn sumIndex(items: []const ProcessData, index: usize) u32 {
-        var total: u32 = 0;
-        for (items) |item| {
-            total += item.times[index];
-        }
-        return total;
-    }
-
-    fn integrateTimes(m: *Monitor) void {
-        for (m.times, 0..) |*t, i| {
-            // again have to account for the skip so mult by 2
-            t.* = sumIndex(m.procs.items, i * 2);
-        }
+        rd.calculateOccupancy();
     }
 };
 
@@ -148,10 +192,6 @@ pub const EnergyUsage = struct {
     }
 };
 
-fn totalTimeSort(_: void, lhs: ProcessData, rhs: ProcessData) bool {
-    return lhs.sum_times < rhs.sum_times;
-}
-
 fn loadBPFAndAttach(alloc: std.mem.Allocator) !bpf.BpfProg {
     // allocate the bytes to heap
     const prog_bytes = try alloc.dupe(u8, PROG_BPF);
@@ -169,11 +209,7 @@ pub fn main() !void {
     var stdout = std.io.getStdOut();
     var writer = stdout.writer();
 
-    var mem = std.heap.ArenaAllocator.init(
-        std.heap.c_allocator,
-    );
-    defer mem.deinit();
-    var alloc = mem.allocator();
+    var alloc = std.heap.c_allocator;
 
     var rapl_reader = rapl.RaplReader(CPU_PATHS.len, CPU_PATHS).init();
     for (rapl_reader.paths) |path| {
@@ -187,11 +223,8 @@ pub fn main() !void {
 
     var hmap = try prog.getMap(RuntimeMap, "runtime_lookup");
 
-    var mon = try Monitor.init(alloc, 4);
-    defer mon.deinit();
-
-    var usage = try EnergyUsage.init(alloc, 2);
-    defer usage.deinit();
+    var data = try RawData.init(alloc, 4);
+    defer data.deinit();
 
     var counter: usize = 0;
     while (true) {
@@ -206,54 +239,55 @@ pub fn main() !void {
             init_energies[i] = current_energies[i];
         }
 
-        try mon.readMap(&hmap);
-        try printTopN(writer, mon.procs.items, 5);
+        try data.readMap(&hmap);
+        try printTopN(alloc, writer, data, 5);
 
-        try writer.print("----\nTotal number of procs: {d}\n", .{mon.procs.items.len});
+        try writer.print("----\nTotal number of procs: {d}\n", .{data.data.count()});
         try writer.writeAll("----\nTot         : ");
-        try printLine(writer, u64, mon.times, false);
+        try printLine(writer, u64, data.times, false);
         try writer.writeAll("\n");
 
         try printEnergy(writer, &energy_diff);
         try writer.writeAll("\n");
 
         // sum over socket
-        for (0.., energy_diff) |i, en| {
-            const i_1 = i * 2;
-            const i_2 = (i + 1) * 2;
+        // for (0.., energy_diff) |i, en| {
+        //     const i_1 = i * 2;
+        //     const i_2 = (i + 1) * 2;
 
-            const total_cpu_time: f32 = @floatFromInt(mon.times[i] + mon.times[i + 1]);
-            const energy: f32 = @floatFromInt(en);
+        //     const total_cpu_time: f32 = @floatFromInt(mon.times[i] + mon.times[i + 1]);
+        //     const energy: f32 = @floatFromInt(en);
 
-            for (mon.procs.items) |proc| {
-                const t1: f32 = @floatFromInt(proc.times[i_1]);
-                const t2: f32 = @floatFromInt(proc.times[i_2]);
-                const e_usage = (t1 + t2) / total_cpu_time * energy;
-                try usage.put(i, proc.pid, e_usage);
-            }
-        }
+        //     for (mon.procs.items) |proc| {
+        //         const t1: f32 = @floatFromInt(proc.times[i_1]);
+        //         const t2: f32 = @floatFromInt(proc.times[i_2]);
+        //         const e_usage = (t1 + t2) / total_cpu_time * energy;
+        //         try usage.put(i, proc.pid, e_usage);
+        //     }
+        // }
 
-        mon.clear();
-        if (counter == 2) break;
+        data.clear();
+        // if (counter == 2) break;
         counter += 1;
     }
 
     // assemble the output data from views into everything that's already allocated
     // make sure this uses arena allocator
-    var cpus = try alloc.alloc(CpuData, init_energies.len);
-    for (0.., cpus) |i, *cpu| {
-        cpu.* = try gatherCPU(alloc, usage, i);
-    }
 
-    var output: OutputStructure = .{ .cpus = cpus };
+    // var cpus = try alloc.alloc(CpuData, init_energies.len);
+    // for (0.., cpus) |i, *cpu| {
+    //     cpu.* = try gatherCPU(alloc, usage, i);
+    // }
 
-    const json = try std.json.stringifyAlloc(
-        alloc,
-        output,
-        .{ .whitespace = .indent_4 },
-    );
+    // var output: OutputStructure = .{ .cpus = cpus };
 
-    try std.fs.cwd().writeFile("data.json", json);
+    // const json = try std.json.stringifyAlloc(
+    //     alloc,
+    //     output,
+    //     .{ .whitespace = .indent_4 },
+    // );
+
+    // try std.fs.cwd().writeFile("data.json", json);
 }
 
 pub const OutputStructure = struct {
@@ -298,14 +332,19 @@ fn printEnergy(writer: anytype, items: []const u64) !void {
     try writer.writeAll("\n");
 }
 
-fn printTopN(writer: anytype, items: []const ProcessData, N: usize) !void {
+fn printTopN(alloc: std.mem.Allocator, writer: anytype, data: RawData, N: usize) !void {
+    var ordered_pids = try data.getOccupancySortedPids(alloc);
+    defer alloc.free(ordered_pids);
+
     try writer.writeAll("Top 5:\n");
 
-    for (items, 0..) |proc, i| {
+    for (ordered_pids, 0..) |pid, i| {
         if (i > N) break;
-        try writer.print("PID {d: >8}: ", .{proc.pid});
-        for (0.., proc.times, proc.occupancy) |k, t, o| {
-            if (k % 2 == 1) continue;
+
+        const entry = data.data.get(pid).?;
+
+        try writer.print("PID {d: >8}: ", .{pid});
+        for (entry.times, entry.occupancy) |t, o| {
             try writer.print(" {d: >8} ({d: >3.0}%)", .{ t, o * 100 });
         }
         try writer.writeAll("\n");
