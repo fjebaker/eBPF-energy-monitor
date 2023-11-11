@@ -29,6 +29,20 @@ As it executes, the program will display execution times and energy usages of ea
 
 The data file may be given to the analysis script in `analysis/analysis.jl` in order to create a plot like the above, showing the top 10 energy consuming processes per CPU, along with the total energy consumed by that CPU.
 
+```
+Top 5:
+PID        0:    987113 ( 99%)   996122 ( 99%)   983130 ( 98%)   989343 ( 99%)
+PID     2646:         0 (  0%)       93 (  0%)     4897 (  0%)     3388 (  0%)
+PID   578679:         0 (  0%)        0 (  0%)     4658 (  0%)        0 (  0%)
+PID     4055:      4481 (  0%)        0 (  0%)        0 (  0%)        0 (  0%)
+PID   577994:      3594 (  0%)        0 (  0%)        0 (  0%)        0 (  0%)
+----
+Total number of procs: 82
+----
+Tot    (us) :           999937         1002248         1000084         1002199
+Energy (uj) :                          3045158                         3050103
+```
+
 ## How it works
 
 The eBPF code latches on to the scheduler switches in order to record how long each process spent in the CPU, and stores this data in a per-CPU hashmap.
