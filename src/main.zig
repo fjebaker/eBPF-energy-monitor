@@ -234,20 +234,60 @@ pub fn main() !void {
         }
 
         mon.clear();
-        if (counter == 20) break;
+        if (counter == 2) break;
         counter += 1;
     }
+
+    // assemble the output data from views into everything that's already allocated
+    // make sure this uses arena allocator
+    var cpus = try alloc.alloc(CpuData, init_energies.len);
+    for (0.., cpus) |i, *cpu| {
+        cpu.* = try gatherCPU(alloc, usage, i);
+    }
+
+    var output: OutputStructure = .{ .cpus = cpus };
+
+    const json = try std.json.stringifyAlloc(
+        alloc,
+        output,
+        .{ .whitespace = .indent_4 },
+    );
+
+    try std.fs.cwd().writeFile("data.json", json);
 }
 
-const OutputStructure = struct {
-    times: []u64,
-    cpu: struct {
-        id: usize,
-        pids: struct {
-            pid: u32,
-            usage: []f32,
-        },
-    },
+pub const OutputStructure = struct {
+    cpus: []CpuData,
+};
+
+pub fn gatherCPU(
+    alloc: std.mem.Allocator,
+    data: EnergyUsage,
+    id: usize,
+) !CpuData {
+    var pids = try alloc.alloc(PidData, data.emaps[id].count());
+    errdefer alloc.free(pids);
+
+    var itt = data.emaps[id].iterator();
+    var i: usize = 0;
+    while (itt.next()) |entry| {
+        std.debug.print("{any}\n", .{entry.value_ptr.items});
+        pids[i] = .{
+            .pid = entry.key_ptr.*,
+            // .usage = entry.value_ptr.items,
+        };
+    }
+
+    return .{ .id = id, .pid_usage = pids };
+}
+
+pub const PidData = struct {
+    pid: u32,
+    // usage: []f32,
+};
+pub const CpuData = struct {
+    id: usize,
+    pid_usage: []PidData,
 };
 
 fn printEnergy(writer: anytype, items: []const u64) !void {
