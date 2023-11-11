@@ -32,16 +32,6 @@ pub const PidEntry = struct {
     }
 };
 
-pub const EnergyTracker = struct {
-    pub const TimeSeries = std.ArrayList(u32);
-
-    usage: TimeSeries,
-
-    pub fn init(alloc: std.mem.Allocator) EnergyTracker {
-        return .{ .usage = TimeSeries.init(alloc) };
-    }
-};
-
 pub const RawData = struct {
     pub const PidMap = std.AutoHashMap(u32, PidEntry);
 
@@ -116,10 +106,10 @@ pub const RawData = struct {
 
         while (itt.next()) |vptr| {
             for (vptr.occupancy, vptr.times, self.times) |*o, t, tot| {
-                const time: f32 = @floatFromInt(t);
+                const elapsed: f32 = @floatFromInt(t);
                 const total: f32 = @floatFromInt(tot);
 
-                o.* = time / total;
+                o.* = elapsed / total;
             }
         }
     }
@@ -147,47 +137,78 @@ pub const RawData = struct {
     }
 };
 
+pub const TimeStamp = struct {
+    time: u64,
+    usage: f32,
+};
+
+pub const PidUsage = struct {
+    pid: u32,
+    usage: []TimeStamp,
+};
+
 pub const EnergyUsage = struct {
-    const EMap = std.AutoHashMap(u32, std.ArrayList(f32)); // pid -> energy time series
+    pub const Tracker = std.AutoHashMap(u32, std.ArrayList(TimeStamp));
 
     alloc: std.mem.Allocator,
-    emaps: []EMap,
-    times: std.ArrayList(u64),
+    trackers: []Tracker,
 
     pub fn init(alloc: std.mem.Allocator, N: usize) !EnergyUsage {
-        var emaps = try alloc.alloc(EMap, N);
-        errdefer alloc.free(emaps);
+        var trackers = try alloc.alloc(Tracker, N);
+        errdefer alloc.free(trackers);
 
-        var times = std.ArrayList(u64).init(alloc);
-        errdefer times.deinit();
+        for (trackers) |*e| e.* = Tracker.init(alloc);
 
-        for (emaps) |*e| e.* = EMap.init(alloc);
-
-        return .{ .alloc = alloc, .emaps = emaps, .times = times };
+        return .{ .alloc = alloc, .trackers = trackers };
     }
 
-    pub fn put(self: *EnergyUsage, index: usize, key: u32, value: f32) !void {
-        var map: *EMap = &self.emaps[index];
-        if (map.contains(key)) {
-            try map.getPtr(key).?.append(value);
+    pub fn toPidUsage(self: *const EnergyUsage, alloc: std.mem.Allocator, index: usize) ![]PidUsage {
+        var pids = try alloc.alloc(PidUsage, self.trackers[index].count());
+        errdefer alloc.free(pids);
+
+        var itt = self.trackers[index].iterator();
+        var i: usize = 0;
+        while (itt.next()) |entry| {
+            const pid = entry.key_ptr.*;
+            const usage = entry.value_ptr.items;
+            pids[i] = .{ .pid = pid, .usage = usage };
+            i += 1;
+        }
+
+        return pids;
+    }
+
+    pub fn pushUsage(
+        self: *EnergyUsage,
+        cpu: usize,
+        pid: u32,
+        time: u64,
+        value: f32,
+    ) !void {
+        var tracker = &self.trackers[cpu];
+
+        if (tracker.contains(pid)) {
+            var list = tracker.getPtr(pid).?;
+            try list.append(.{ .time = time, .usage = value });
         } else {
-            var array_list = std.ArrayList(f32).init(self.alloc);
-            errdefer array_list.deinit();
-            try array_list.append(value);
-            try map.put(key, array_list);
+            var list = std.ArrayList(TimeStamp).init(self.alloc);
+            errdefer list.deinit();
+
+            try list.append(.{ .time = time, .usage = value });
+
+            try tracker.putNoClobber(pid, list);
         }
     }
 
     pub fn deinit(self: *EnergyUsage) void {
-        for (self.emaps) |*e| {
-            var itt = e.valueIterator();
+        for (self.trackers) |*t| {
+            var itt = t.valueIterator();
             while (itt.next()) |v| {
                 v.deinit();
             }
-            e.deinit();
+            t.deinit();
         }
-        self.alloc.free(self.emaps);
-        self.times.deinit();
+        self.alloc.free(self.trackers);
         self.* = undefined;
     }
 };
@@ -210,6 +231,9 @@ pub fn main() !void {
     var writer = stdout.writer();
 
     var alloc = std.heap.c_allocator;
+    // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    // defer _ = gpa.deinit();
+    // var alloc = gpa.allocator();
 
     var rapl_reader = rapl.RaplReader(CPU_PATHS.len, CPU_PATHS).init();
     for (rapl_reader.paths) |path| {
@@ -226,9 +250,14 @@ pub fn main() !void {
     var data = try RawData.init(alloc, 4);
     defer data.deinit();
 
+    var usage = try EnergyUsage.init(alloc, 2);
+    defer usage.deinit();
+
     var counter: usize = 0;
+
+    std.time.sleep(std.time.ns_per_s);
     while (true) {
-        std.time.sleep(1_000_000_000);
+        const time_start = std.time.nanoTimestamp();
 
         var current_energies = try rapl_reader.read();
 
@@ -250,78 +279,73 @@ pub fn main() !void {
         try printEnergy(writer, &energy_diff);
         try writer.writeAll("\n");
 
+        const now_milis: u64 = @intCast(@divFloor(time_start, 1000));
+
         // sum over socket
-        // for (0.., energy_diff) |i, en| {
-        //     const i_1 = i * 2;
-        //     const i_2 = (i + 1) * 2;
+        for (0.., energy_diff) |i, diff| {
+            const j1 = i * 2;
 
-        //     const total_cpu_time: f32 = @floatFromInt(mon.times[i] + mon.times[i + 1]);
-        //     const energy: f32 = @floatFromInt(en);
+            const total_socket_time: f32 = @floatFromInt(
+                data.times[j1] + data.times[j1 + 1],
+            );
+            const energy_difference: f32 = @floatFromInt(diff);
 
-        //     for (mon.procs.items) |proc| {
-        //         const t1: f32 = @floatFromInt(proc.times[i_1]);
-        //         const t2: f32 = @floatFromInt(proc.times[i_2]);
-        //         const e_usage = (t1 + t2) / total_cpu_time * energy;
-        //         try usage.put(i, proc.pid, e_usage);
-        //     }
-        // }
+            var itt = data.data.iterator();
+            while (itt.next()) |entry| {
+                const proc = entry.value_ptr;
+                const t1: f32 = @floatFromInt(proc.times[j1]);
+                const t2: f32 = @floatFromInt(proc.times[j1 + 1]);
+
+                const total_time = t1 + t2;
+
+                const occupation = total_time / total_socket_time;
+                const pid_energy = occupation * energy_difference;
+
+                try usage.pushUsage(i, entry.key_ptr.*, now_milis, pid_energy);
+            }
+        }
 
         data.clear();
-        // if (counter == 2) break;
+        if (counter == 300) break;
         counter += 1;
+        const delta: u64 = @intCast(std.time.nanoTimestamp() - time_start);
+
+        std.time.sleep(std.time.ns_per_s - delta);
     }
 
     // assemble the output data from views into everything that's already allocated
     // make sure this uses arena allocator
 
-    // var cpus = try alloc.alloc(CpuData, init_energies.len);
-    // for (0.., cpus) |i, *cpu| {
-    //     cpu.* = try gatherCPU(alloc, usage, i);
-    // }
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var arena_alloc = arena.allocator();
 
-    // var output: OutputStructure = .{ .cpus = cpus };
+    var cpus = try arena_alloc.alloc(CpuData, init_energies.len);
+    for (0.., cpus) |i, *cpu| {
+        cpu.* = .{
+            .id = i,
+            .pid_usage = try usage.toPidUsage(arena_alloc, i),
+        };
+    }
 
-    // const json = try std.json.stringifyAlloc(
-    //     alloc,
-    //     output,
-    //     .{ .whitespace = .indent_4 },
-    // );
+    var output: OutputStructure = .{ .cpus = cpus };
 
-    // try std.fs.cwd().writeFile("data.json", json);
+    const json = try std.json.stringifyAlloc(
+        arena_alloc,
+        output,
+        .{ .whitespace = .indent_4 },
+    );
+
+    try std.fs.cwd().writeFile("data.json", json);
 }
 
 pub const OutputStructure = struct {
     cpus: []CpuData,
 };
 
-pub fn gatherCPU(
-    alloc: std.mem.Allocator,
-    data: EnergyUsage,
-    id: usize,
-) !CpuData {
-    var pids = try alloc.alloc(PidData, data.emaps[id].count());
-    errdefer alloc.free(pids);
-
-    var itt = data.emaps[id].iterator();
-    var i: usize = 0;
-    while (itt.next()) |entry| {
-        std.debug.print("{any}\n", .{entry.value_ptr.items});
-        pids[i] = .{
-            .pid = entry.key_ptr.*,
-            // .usage = entry.value_ptr.items,
-        };
-    }
-
-    return .{ .id = id, .pid_usage = pids };
-}
-
-pub const PidData = struct {
-    pid: u32,
-    // usage: []f32,
-};
 pub const CpuData = struct {
     id: usize,
-    pid_usage: []PidData,
+    pid_usage: []PidUsage,
 };
 
 fn printEnergy(writer: anytype, items: []const u64) !void {
